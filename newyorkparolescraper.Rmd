@@ -1,0 +1,264 @@
+---
+title: "NY Parole Board Scraper"
+output: html_notebook
+author: daniel robert turner
+date: 03-03-2023
+---
+
+This script retrieves data from 'www.publicapps.doccs.ny.gov/ParoleBoardCalendar/'.
+
+V1 Was pure rvest but couldn't access DIN-level information.
+V2 Uses Selenium to spoof a browser and scrape by clicking on elements directly.
+V3 Scrapes additional information from the DIN page and improves error handling.
+V4 Adds columns to help locate missing data.
+
+## General Setup
+```{r setup}
+
+library( tidyverse )
+library( rvest )
+library( RSelenium )
+library( tictoc )
+
+```
+
+# Version 1--Using rvest to submit the form directly
+Retracing some of the steps using rvest since the data extraction will be similar
+
+```{r}
+
+# Start the scraping session by getting the HTML
+url_base = 'https://publicapps.doccs.ny.gov/ParoleBoardCalendar/Default'
+sesh = session( url_base ) 
+
+# Currently, just trying to scrape all the results for one month
+# This could be situated in a loop to get all combinations later without much difficulty
+vals <- list('ctl00$MainContent$ddlMonth' = "01", 'ctl00$MainContent$ddlYear' = "2022")
+
+# Select and modify the form to the desired year/month
+submit.to.calendar = sesh %>% read_html() %>% html_form() %>% last() %>% html_form_set(!!!vals)
+
+# Submit the html form to get the calendar response
+calendar.response = html_form_submit( submit.to.calendar )
+
+# Check the response
+print(calendar.response %>% read_html())
+
+## Extract calendar table (list of inmates) from calendar response
+# A
+calendar.table = calendar.response %>%
+  read_html() %>%
+  html_nodes('table#MainContent_manyResultsTable') %>%
+  html_table() %>%
+  as.data.frame()
+
+# Peek at the calendar table
+sample_n( calendar.table, 12 )
+
+```
+
+# Scraping with Selenium
+
+## Bug check
+Note there is a common bug in rsDriver() that can be circumvented by installing the latest version of JDK:
+https://www.oracle.com/java/technologies/downloads/
+
+```{r include=FALSE}
+# Launch a Firefox instance, enter as a client
+rD <- rsDriver(browser = "firefox", chromever = NULL)
+remDr <- rD[["client"]]
+```
+
+
+## Scraper chunk
+
+```{r include=FALSE}
+
+# What year to scrape?
+the.year = "2022"
+
+# For testing
+the.letter = "G"
+the.month = "October"
+
+# Loop month by month, then letter by letter, then DIN by DIN...
+tic("scraping")
+
+# Create the Tank, which we will populate with inmates with DIN-level data
+pbTank = data.frame()
+
+# Create the Stack, which will populate with inmates with any data
+pbStack = data.frame()
+
+# Loop the months
+for( the.month in month.name ){
+  
+  # Common starting point
+  remDr$navigate( url_base )
+  
+  # Set the month/year
+  remDr$findElement(using = "id", value = "MainContent_ddlMonth")$sendKeysToElement(list(the.month))
+  remDr$findElement(using = "id", value = "MainContent_ddlMonth")$sendKeysToElement(list(the.month)) # turns out to help in a lot of cases to select the month twice.
+  remDr$findElement(using = "id", value = "MainContent_ddlYear")$sendKeysToElement(list(the.year))
+  remDr$findElement(using = "id", value = "MainContent_ddlYear")$sendKeysToElement(list(the.year)) # just to be safe
+  
+  # Submit the form by selecting the button and clicking
+  webElem <- remDr$findElement(using = 'xpath', '//*[@id="MainContent_btnSubmit"]')
+  webElem$clickElement()
+  
+  # Get the month/year from the page
+  letterMonth <- remDr$getPageSource()[[1]] %>% 
+    read_html() %>%
+    html_nodes('div#MainContent_manyResultsDiv > h2') %>%
+    html_text() %>%
+    str_remove("\n") %>%
+    trimws()
+  
+  # From Z to A, loop through the alphabet to get results table
+  for( the.letter in rev( LETTERS ) ){  # We go in reverse alphabetical order so load each result the same way
+    
+    # Navigate to the letter and click on it
+    webElem <- remDr$findElement(using = 'link text', the.letter)
+    webElem$clickElement()
+    
+    # Show a message since this takes a while
+    message(paste("Processing:", letterMonth, the.letter))
+    
+    # Parse the table in the result
+    letterTable = remDr$getPageSource()[[1]] %>% 
+        read_html() %>%
+        html_nodes('table#MainContent_manyResultsTable') %>%
+        html_table() %>%
+        as.data.frame()
+    
+    # Add the letterTable to the Stack
+    pbStack = bind_rows( pbStack, letterTable )
+  
+    # Adding the attempted and retrieved months to the output
+    letterTable$stated_month = letterMonth
+    letterTable$queried_month = paste(the.month, the.year)
+    letterTable$expected_month = letterTable$stated_month == letterTable$queried_month
+    
+    # Are there inmates with DINs to scrape?
+    letterEmpty = any( str_detect( letterTable, "No inmate interviews exist for this name/month.") )
+    
+    # If there are DINs to scrape, go to work...
+    if(!letterEmpty){
+      
+        # Collect the DINS
+        the.dins = letterTable$DIN
+
+        # Loop the DINS, clicking and scraping as we go
+        for( the.din in the.dins ){
+
+          # Navigate to, and click on the din link
+          webElem <- remDr$findElement(using = 'link text', the.din)
+          webElem$clickElement()
+          
+          # Show a message when we scrape a DIN page
+          message("Retrieving additional data for: ", the.din)
+          
+          # Extract the top table
+          dinTable = remDr$getPageSource()[[1]] %>% 
+              read_html() %>%
+              html_nodes('table#MainContent_paroleeInformation') %>%
+              html_table() %>%
+              as.data.frame()
+
+          # In rare cases there's no data on the DIN page
+          #    in which case we would skip the following and just go back to the letter page
+          if( length(dinTable) != 0 ){
+              
+              # Pivot the table to make the first row colnames and the second row values
+              dinTable = dinTable %>%
+                  rownames_to_column() %>%  
+                  pivot_longer(-rowname) %>% 
+                  pivot_wider(names_from=rowname, values_from=value) 
+            
+              # Add colnames from the first row; remove colons as we go
+              names( dinTable ) = as.character(unlist( dinTable[1,])) %>%str_replace_all( ":", "" )
+
+              # Subset out the first row
+              dinTable = dinTable[-1,]
+              
+              # Delete any missing or NA fields
+              dinTable = dinTable %>%
+                  select_if(~!(all(is.na(.)) | all(. == "")))
+
+              # Extract the bottom table, consisting of convictions
+              conTable = remDr$getPageSource()[[1]] %>% 
+                  read_html() %>%
+                  html_nodes('table#MainContent_offenseInformationTable') %>%
+                  html_table() %>%
+                  as.data.frame( )
+            
+              # Append the second table data as lists in string format (CSV friendly, much easier than relational databases)
+              dinTable$Crimes_Names  = paste(conTable$Crime.of.conviction, sep = "", collapse = ',' )
+              dinTable$Crimes_Class  = paste(conTable$Class, sep = "", collapse = ',' )
+              dinTable$Crimes_County = paste(conTable$County.of.commitment, sep = "", collapse = ',' ) 
+              
+              # Clean up the output
+              dinTable = dinTable %>%
+                  select(-X1)
+              
+              # Join the letter and DIN-level data to the Tank
+              tankRow = merge( letterTable, dinTable, by="DIN" )
+              tankRow$dinParsed = TRUE
+
+            } else { # no parse-able DIN-level data
+              
+              # Join the letter-level data to Tank
+              tankRow = letterTable %>% subset(DIN == the.din)
+              tankRow$dinParsed = FALSE
+              
+              } # end empty DIN conditional
+          
+            # Add tankRow to Tank
+            pbTank = bind_rows( pbTank, tankRow )
+            
+            # Go back to letters
+            remDr$goBack()
+ 
+          } # end din loop
+
+      } # end empty letter conditional
+ 
+    } # end letter loop
+  
+} # end month loop
+
+# end timing
+toc()
+
+# Set the paths accordingly.
+# I think there here package might work for both of us.
+
+# Write results into CSVs
+write_csv( pbTank, paste0(here::here(), "/Desktop/nypb_", the.year, "_results.csv"))
+# write_csv( pbStack, "/Users/dt/Exports/nyscraper-2022.csv") # not used
+
+# Check which DINs were not shared
+DINerr = pbTank %>% filter(dinParsed == FALSE)
+write_csv( DINerr, paste0(here::here(), "/Desktop/nypb_", the.year, "_DINerr.csv"))
+
+```
+
+# Wrap up
+
+```{r}
+
+remDr$close()
+# stop the selenium server
+rD[["server"]]$stop()
+
+```
+
+# Check out the data
+
+```{r}
+
+nrow(unique(pbTank))
+table( pbTank$stated_month )
+
+```
+
